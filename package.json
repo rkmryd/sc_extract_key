@@ -1,0 +1,15 @@
+{
+  "name": "scp-standalone",
+  "version": "1.0.0",
+  "description": "MMP mouflon key extractor for stripchat HLS streams",
+  "main": "extract_mmp_keys.js",
+  "scripts": {
+    "extract": "node extract_mmp_keys.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.37.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
