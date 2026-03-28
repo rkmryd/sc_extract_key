@@ -326,7 +326,7 @@ CHUNK_URL_PATTERN = "mmp.doppiocdn.com/player/mmp/"
 
 # Regex to find the for-loop + arrow closure that assembles pdkey
 FOR_LOOP_RE = re.compile(
-    r"for\(let \w of this\[.{1,20}\]\)\w=\w\[.{1,30}\]\(\w,\w,\(\)=>"
+    r"for\(let \w+ of this(?:\[.{1,40}\]|\.\w+)\)\w+=\w+\[.{1,30}\]\(\w+,\w+,\(\)=>"
 )
 
 

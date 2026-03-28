@@ -43,7 +43,7 @@ const TIMEOUT_MS = 90_000;   // total wait (workers may take longer to start)
 const CHUNK_URL_PATTERN = 'mmp.doppiocdn.com/player/mmp/';
 
 // Regex to find the for-loop + arrow closure that assembles pdkey
-const FOR_LOOP_REGEX = /for\(let \w of this\[.{1,20}\]\)\w=\w\[.{1,30}\]\(\w,\w,\(\)=>/;
+const FOR_LOOP_REGEX = /for\(let \w+ of this(?:\[.{1,40}\]|\.\w+)\)\w+=\w+\[.{1,30}\]\(\w+,\w+,\(\)=>/;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
