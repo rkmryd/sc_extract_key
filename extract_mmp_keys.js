@@ -37,13 +37,71 @@ const puppeteer = require('puppeteer');
 
 const MODEL      = process.argv[2] || 'MetishaCaprice';
 const PAGE_URL   = `https://stripchat.com/${MODEL}`;
-const TIMEOUT_MS = 90_000;   // total wait (workers may take longer to start)
+const TIMEOUT_MS = (Number.parseInt(process.env.SC_TIMEOUT_S || '90', 10) || 90) * 1000;
+const PDKEY_GRACE_MS = (Number.parseInt(process.env.SC_PDKEY_GRACE_S || '15', 10) || 15) * 1000;
 
 // URL substring to identify the MMP player chunk (version-resilient)
 const CHUNK_URL_PATTERN = 'mmp.doppiocdn.com/player/mmp/';
 
 // Regex to find the for-loop + arrow closure that assembles pdkey
 const FOR_LOOP_REGEX = /for\(let \w+ of this(?:\[.{1,40}\]|\.\w+)\)\w+=\w+\[.{1,30}\]\(\w+,\w+,\(\)=>/;
+
+function extractArrowBody(source, arrowBodyStart) {
+  let depth = 0, braceDepth = 0, bracketDepth = 0;
+  for (let i = arrowBodyStart; i < arrowBodyStart + 20000 && i < source.length; i++) {
+    const ch = source[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    else if (ch === '{') braceDepth++;
+    else if (ch === '}') braceDepth--;
+    else if (ch === '[') bracketDepth++;
+    else if (ch === ']') bracketDepth--;
+    if (ch === ',' && depth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      return source.slice(arrowBodyStart, i);
+    }
+  }
+  return null;
+}
+
+function findPdkeyExprCandidates(source, coerceIdx) {
+  const regionStart = Math.max(0, coerceIdx - 120000);
+  const regionEnd = Math.min(source.length, coerceIdx + 40000);
+  const region = source.slice(regionStart, regionEnd);
+  const candidates = [];
+  const seen = new Set();
+
+  const robustForLoop = /for\((?:let|const|var)\s+\w+\s+of\s+this(?:\[[^\]]{1,80}\]|\.\w+)\)\s*\w+\s*=\s*\w+(?:\[[^\]]{1,80}\]|\.\w+)\(\s*[^,]{1,120}\s*,\s*[^,]{1,120}\s*,\s*\(\)\s*=>/g;
+
+  for (const m of region.matchAll(robustForLoop)) {
+    const forLoopCol = regionStart + m.index;
+    const arrowBodyStart = regionStart + m.index + m[0].length;
+    const expr = extractArrowBody(source, arrowBodyStart);
+    if (!expr || expr.length < 8 || expr.length > 12000 || seen.has(expr)) continue;
+    seen.add(expr);
+    candidates.push({ forLoopCol, expr });
+    if (candidates.length >= 16) break;
+  }
+
+  if (candidates.length === 0) {
+    for (const am of region.matchAll(/\(\)\s*=>/g)) {
+      const arrowBodyStart = regionStart + am.index + am[0].length;
+      const lookbackStart = Math.max(regionStart, regionStart + am.index - 260);
+      const lookback = source.slice(lookbackStart, regionStart + am.index);
+      const forIdx = lookback.lastIndexOf('for(');
+      if (forIdx < 0) continue;
+      const snippet = lookback.slice(forIdx);
+      if (!snippet.includes(' of this')) continue;
+      const forLoopCol = lookbackStart + forIdx;
+      const expr = extractArrowBody(source, arrowBodyStart);
+      if (!expr || expr.length < 8 || expr.length > 12000 || seen.has(expr)) continue;
+      seen.add(expr);
+      candidates.push({ forLoopCol, expr });
+      if (candidates.length >= 16) break;
+    }
+  }
+
+  return candidates;
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -69,45 +127,57 @@ function makePausedHandler(session, context, state, tryResolve) {
     try {
       const col = evt.callFrames[0]?.location?.columnNumber;
 
-      // Only handle if we have the closure expression ready
-      if (state.pdkeyClosureExpr && !state.pdkey) {
+      const exprCandidates = state.pdkeyExprCandidates?.length
+        ? state.pdkeyExprCandidates
+        : (state.pdkeyClosureExpr ? [state.pdkeyClosureExpr] : []);
+
+      // Only handle if we have closure candidates ready
+      if (exprCandidates.length > 0 && !state.pdkey) {
         state._evalCount = (state._evalCount || 0) + 1;
-        if (state._evalCount > 3) {
+        if (state._evalCount > 8) {
           await session.send('Debugger.resume');
           return;
         }
         const frameId = evt.callFrames[0]?.callFrameId;
         if (frameId) {
-          console.log(`${context}[paused] col ${col} — evaluating pdkey closure…`);
-          const r = await session.send('Debugger.evaluateOnCallFrame', {
-            callFrameId: frameId,
-            expression: state.pdkeyClosureExpr,
-            returnByValue: true,
-            throwOnSideEffect: false,
-          });
-          if (!r.exceptionDetails && typeof r.result.value === 'string') {
-            const val = r.result.value;
-            console.log(`${context}[eval  ] → "${val}" (len=${val.length})`);
-            // v2.4.2 returned "pkey:pdkey"; v2.4.3+ returns pdkey only
-            if (val.includes(':')) {
-              const colonIdx = val.indexOf(':');
-              const pkeyPart  = val.slice(0, colonIdx);
-              const pdkeyPart = val.slice(colonIdx + 1);
-              if (isKeyCandidate(pkeyPart) && isKeyCandidate(pdkeyPart)) {
-                if (!state.pkey)  state.pkey  = pkeyPart;
-                if (!state.pdkey) state.pdkey = pdkeyPart;
-                console.log(`${context}[FOUND ] pkey="${state.pkey}" pdkey="${state.pdkey}"`);
+          console.log(`${context}[paused] col ${col} — evaluating pdkey candidates…`);
+          for (const [idx, expr] of exprCandidates.slice(0, 8).entries()) {
+            const r = await session.send('Debugger.evaluateOnCallFrame', {
+              callFrameId: frameId,
+              expression: expr,
+              returnByValue: true,
+              throwOnSideEffect: false,
+            });
+            if (!r.exceptionDetails && typeof r.result.value === 'string') {
+              const val = r.result.value;
+              console.log(`${context}[eval  ] cand#${idx + 1} → "${val}" (len=${val.length})`);
+              // v2.4.2 returned "pkey:pdkey"; v2.4.3+ returns pdkey only
+              if (val.includes(':')) {
+                const colonIdx = val.indexOf(':');
+                const pkeyPart  = val.slice(0, colonIdx);
+                const pdkeyPart = val.slice(colonIdx + 1);
+                if (isKeyCandidate(pkeyPart) && isKeyCandidate(pdkeyPart)) {
+                  if (!state.pkey)  state.pkey  = pkeyPart;
+                  if (!state.pdkey) {
+                    state.pdkey = pdkeyPart;
+                    state.pdkeyFoundAt = Date.now();
+                  }
+                  console.log(`${context}[FOUND ] pkey="${state.pkey}" pdkey="${state.pdkey}"`);
+                  tryResolve();
+                  break;
+                }
+              } else if (isKeyCandidate(val)) {
+                state.pdkey = val;
+                state.pdkeyFoundAt = Date.now();
+                console.log(`${context}[FOUND ] pdkey="${state.pdkey}"`);
                 tryResolve();
+                break;
               }
-            } else if (isKeyCandidate(val)) {
-              state.pdkey = val;
-              console.log(`${context}[FOUND ] pdkey="${state.pdkey}"`);
-              tryResolve();
+            } else if (r.exceptionDetails && idx === 0) {
+              const msg = r.exceptionDetails.text ||
+                          r.exceptionDetails.exception?.description || '?';
+              console.log(`${context}[eval  ] cand#1 EXCEPTION: ${msg.slice(0, 200)}`);
             }
-          } else if (r.exceptionDetails) {
-            const msg = r.exceptionDetails.text ||
-                        r.exceptionDetails.exception?.description || '?';
-            console.log(`${context}[eval  ] EXCEPTION: ${msg.slice(0, 200)}`);
           }
         }
       }
@@ -115,7 +185,9 @@ function makePausedHandler(session, context, state, tryResolve) {
       await session.send('Debugger.resume');
     } catch (err) {
       await session.send('Debugger.resume').catch(() => {});
-      console.error(`${context}[CDP] error in paused handler: ${err.message}`);
+      if (!String(err.message || '').includes('Target closed')) {
+        console.error(`${context}[CDP] error in paused handler: ${err.message}`);
+      }
     }
   };
 }
@@ -137,75 +209,46 @@ async function handleChunkParsed(session, evt, label, state) {
     }
     console.log(`[CDP${label}] coerceTimestamps at col ${coerceIdx} (source len=${source.length})`);
 
-    // Search the region before coerceTimestamps for the for-loop pattern
-    const searchStart = Math.max(0, coerceIdx - 100000);
-    const region = source.slice(searchStart, coerceIdx);
-    const m = FOR_LOOP_REGEX.exec(region);
-    if (!m) {
-      console.log(`[CDP${label}] for-loop pattern not found — trying full source…`);
-      const mFull = FOR_LOOP_REGEX.exec(source);
-      if (!mFull) {
-        console.log(`[CDP${label}] for-loop pattern not found anywhere`);
-        return;
-      }
-      // Use the full-source match
-      const forLoopCol = mFull.index;
-      const arrowBodyStart = mFull.index + mFull[0].length;
-      return await extractClosureAndSetBP(session, evt, label, state, source, forLoopCol, arrowBodyStart);
+    const matches = findPdkeyExprCandidates(source, coerceIdx);
+    if (matches.length === 0) {
+      console.log(`[CDP${label}] no pdkey closure candidates found`);
+      return;
     }
 
-    const forLoopCol = searchStart + m.index;
-    const arrowBodyStart = searchStart + m.index + m[0].length;
-    await extractClosureAndSetBP(session, evt, label, state, source, forLoopCol, arrowBodyStart);
+    state.pdkeyExprCandidates = matches.map(m => m.expr);
+    state.pdkeyClosureExpr = state.pdkeyExprCandidates[0];
+    console.log(`[CDP${label}] found ${matches.length} closure candidate(s)`);
+
+    for (const [idx, m] of matches.slice(0, 3).entries()) {
+      console.log(`[CDP${label}] cand#${idx + 1} for-loop col ${m.forLoopCol}, expr ${m.expr.length} chars`);
+      console.log(`[CDP${label}] cand#${idx + 1} starts: ${m.expr.slice(0, 60)}`);
+      console.log(`[CDP${label}] cand#${idx + 1} ends:   ${m.expr.slice(-60)}`);
+    }
+
+    const seenCols = new Set();
+    for (const m of matches.slice(0, 6)) {
+      if (seenCols.has(m.forLoopCol)) continue;
+      seenCols.add(m.forLoopCol);
+      await setBreakpointsNearLoop(session, evt, label, m.forLoopCol);
+    }
   } catch (e) {
     console.warn(`[CDP${label}] handleChunkParsed error: ${e.message}`);
   }
 }
 
 /**
- * Extract the closure body and set breakpoints at the for-loop location.
+ * Set breakpoints near a candidate for-loop location.
  */
-async function extractClosureAndSetBP(session, evt, label, state, source, forLoopCol, arrowBodyStart) {
-  console.log(`[CDP${label}] for-loop at col ${forLoopCol}, arrow body starts at col ${arrowBodyStart}`);
-
-  // Find end of arrow body by matching parens/braces/brackets until top-level comma
-  let depth = 0, braceDepth = 0, bracketDepth = 0;
-  let arrowBodyEnd = null;
-  for (let i = arrowBodyStart; i < arrowBodyStart + 20000 && i < source.length; i++) {
-    const ch = source[i];
-    if (ch === '(') depth++;
-    else if (ch === ')') depth--;
-    else if (ch === '{') braceDepth++;
-    else if (ch === '}') braceDepth--;
-    else if (ch === '[') bracketDepth++;
-    else if (ch === ']') bracketDepth--;
-    if (ch === ',' && depth === 0 && braceDepth === 0 && bracketDepth === 0) {
-      arrowBodyEnd = i;
-      break;
-    }
-  }
-  if (arrowBodyEnd === null) {
-    console.log(`[CDP${label}] could not find arrow body end`);
-    return;
-  }
-  const arrowBody = source.slice(arrowBodyStart, arrowBodyEnd);
-  console.log(`[CDP${label}] arrow body: cols ${arrowBodyStart}-${arrowBodyEnd} (${arrowBody.length} chars)`);
-  console.log(`[CDP${label}] starts: ${arrowBody.slice(0, 60)}`);
-  console.log(`[CDP${label}] ends:   ${arrowBody.slice(-60)}`);
-  // The arrow body is an expression (not a function call).
-  // Evaluate it directly — it returns the pdkey value.
-  state.pdkeyClosureExpr = arrowBody;
-  // Find exact V8 breakpoint locations near the for-loop
+async function setBreakpointsNearLoop(session, evt, label, forLoopCol) {
   const bpResult = await session.send('Debugger.getPossibleBreakpoints', {
     start: { scriptId: evt.scriptId, lineNumber: 0, columnNumber: forLoopCol },
-    end: { scriptId: evt.scriptId, lineNumber: 0, columnNumber: forLoopCol + 200 },
+    end: { scriptId: evt.scriptId, lineNumber: 0, columnNumber: forLoopCol + 220 },
     restrictToFunction: false,
   });
   const locs = bpResult.locations || [];
-  console.log(`[CDP${label}] ${locs.length} possible BPs near for-loop`);
+  console.log(`[CDP${label}] ${locs.length} possible BPs near col ${forLoopCol}`);
 
-  // Set BPs at the first few valid locations inside the for-loop body
-  for (const loc of locs.slice(0, 5)) {
+  for (const loc of locs.slice(0, 4)) {
     try {
       const r = await session.send('Debugger.setBreakpoint', {
         location: { scriptId: evt.scriptId, lineNumber: loc.lineNumber, columnNumber: loc.columnNumber },
@@ -257,7 +300,13 @@ async function main() {
   });
 
   // Shared state updated by handlers on any context (page or worker)
-  const state = { pkey: null, pdkey: null, pdkeyClosureExpr: null };
+  const state = {
+    pkey: null,
+    pdkey: null,
+    pdkeyClosureExpr: null,
+    pdkeyExprCandidates: [],
+    pdkeyFoundAt: null,
+  };
   let m3u8Pkey = null;
 
 
@@ -272,13 +321,16 @@ async function main() {
       console.log('[timeout] Resolving with partial results…');
       resolveDone();
     }, TIMEOUT_MS - 5_000);
+    let pdkeyGraceTimer = null;
 
     let playTimer = null;  // stored so we can cancel if keys are found early
 
     function tryResolve() {
       if (state.pkey && state.pdkey) {
         clearTimeout(timer);
+        if (pdkeyGraceTimer) clearInterval(pdkeyGraceTimer);
         if (playTimer) clearTimeout(playTimer);
+        console.log('[done  ] both keys captured; finishing…');
         resolveDone();
       }
     }
@@ -291,6 +343,16 @@ async function main() {
         tryResolve();
       }
       if (state.pkey && state.pdkey) clearInterval(poll);
+    }, 500);
+
+    pdkeyGraceTimer = setInterval(() => {
+      if (state.pdkey && !state.pkey && state.pdkeyFoundAt) {
+        if ((Date.now() - state.pdkeyFoundAt) >= PDKEY_GRACE_MS) {
+          console.log(`[timeout] pdkey captured but pkey missing after ${PDKEY_GRACE_MS / 1000}s grace; resolving partial results…`);
+          clearInterval(pdkeyGraceTimer);
+          resolveDone();
+        }
+      }
     }, 500);
 
     // ── Helper: attach debugger to a CDP session (page or worker) ─────────────
@@ -438,6 +500,7 @@ async function main() {
 
     // Wait for both BPs (or timeout)
     await keysReady;
+    if (pdkeyGraceTimer) clearInterval(pdkeyGraceTimer);
     clearInterval(poll);
 
   } finally {

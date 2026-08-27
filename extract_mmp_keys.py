@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import websockets
@@ -326,7 +327,9 @@ CHUNK_URL_PATTERN = "mmp.doppiocdn.com/player/mmp/"
 
 # Regex to find the for-loop + arrow closure that assembles pdkey
 FOR_LOOP_RE = re.compile(
-    r"for\(let \w+ of this(?:\[.{1,40}\]|\.\w+)\)\w+=\w+\[.{1,30}\]\(\w+,\w+,\(\)=>"
+    r"for\((?:let|const|var)\s+\w+\s+of\s+this(?:\[[^\]]{1,80}\]|\.\w+)\)"
+    r"\s*\w+\s*=\s*\w+(?:\[[^\]]{1,80}\]|\.\w+)"
+    r"\(\s*[^,]{1,120}\s*,\s*[^,]{1,120}\s*,\s*\(\)\s*=>"
 )
 
 
@@ -364,6 +367,59 @@ def _extract_arrow_body(source: str, arrow_body_start: int) -> str | None:
     return None
 
 
+def _find_pdkey_expr_candidates(source: str, coerce_idx: int) -> list[tuple[int, str]]:
+    """Find likely pdkey closure expressions and associated for-loop columns.
+
+    Returns a list of (for_loop_col, expression). The first entries are the most
+    likely matches near coerceTimestamps.
+    """
+    region_start = max(0, coerce_idx - 120_000)
+    region_end = min(len(source), coerce_idx + 40_000)
+    region = source[region_start:region_end]
+
+    candidates: list[tuple[int, str]] = []
+    seen_expr: set[str] = set()
+
+    def add_candidate(for_loop_col: int, arrow_body_start: int):
+        expr = _extract_arrow_body(source, arrow_body_start)
+        if not expr:
+            return
+        # Keep expressions that look key-like and avoid giant unrelated closures.
+        if len(expr) < 8 or len(expr) > 12_000:
+            return
+        if expr in seen_expr:
+            return
+        seen_expr.add(expr)
+        candidates.append((for_loop_col, expr))
+
+    # Primary: robust regex for known loop structure.
+    for m in FOR_LOOP_RE.finditer(region):
+        for_loop_col = region_start + m.start()
+        arrow_body_start = region_start + m.end()
+        add_candidate(for_loop_col, arrow_body_start)
+        if len(candidates) >= 16:
+            break
+
+    # Fallback: scan for "() =>" near for-loops over this.* and infer loop column.
+    if not candidates:
+        for am in re.finditer(r"\(\)\s*=>", region):
+            arrow_body_start = region_start + am.end()
+            lookback_start = max(region_start, region_start + am.start() - 260)
+            lookback = source[lookback_start:region_start + am.start()]
+            for_idx = lookback.rfind("for(")
+            if for_idx < 0:
+                continue
+            snippet = lookback[for_idx:]
+            if " of this" not in snippet:
+                continue
+            for_loop_col = lookback_start + for_idx
+            add_candidate(for_loop_col, arrow_body_start)
+            if len(candidates) >= 16:
+                break
+
+    return candidates
+
+
 async def _handle_chunk_parsed(session: CDPSession, evt: dict,
                                 label: str, state: dict):
     """Get script source, find the pdkey closure, and set BPs."""
@@ -380,67 +436,58 @@ async def _handle_chunk_parsed(session: CDPSession, evt: dict,
         print(f"[CDP{label}] coerceTimestamps at col {coerce_idx} "
               f"(source len={len(source)})")
 
-        # Search region before coerceTimestamps, fall back to full source
-        search_start = max(0, coerce_idx - 100_000)
-        region = source[search_start:coerce_idx]
-        m = FOR_LOOP_RE.search(region)
-        if m:
-            for_loop_col = search_start + m.start()
-            arrow_body_start = search_start + m.start() + len(m.group())
-        else:
-            print(f"[CDP{label}] for-loop pattern not in region, trying full source…")
-            m = FOR_LOOP_RE.search(source)
-            if not m:
-                print(f"[CDP{label}] for-loop pattern not found anywhere")
-                return
-            for_loop_col = m.start()
-            arrow_body_start = m.start() + len(m.group())
-
-        print(f"[CDP{label}] for-loop at col {for_loop_col}, "
-              f"arrow body starts at col {arrow_body_start}")
-
-        arrow_body = _extract_arrow_body(source, arrow_body_start)
-        if arrow_body is None:
-            print(f"[CDP{label}] could not find arrow body end")
+        matches = _find_pdkey_expr_candidates(source, coerce_idx)
+        if not matches:
+            print(f"[CDP{label}] no pdkey closure candidates found")
             return
 
-        print(f"[CDP{label}] arrow body: {len(arrow_body)} chars")
-        print(f"[CDP{label}] starts: {arrow_body[:60]}")
-        print(f"[CDP{label}] ends:   {arrow_body[-60:]}")
+        state["pdkey_expr_candidates"] = [expr for _, expr in matches]
+        state["pdkey_closure_expr"] = state["pdkey_expr_candidates"][0]
+        print(f"[CDP{label}] found {len(matches)} closure candidate(s)")
 
-        # Store the raw expression — NOT wrapped in ()
-        state["pdkey_closure_expr"] = arrow_body
+        for idx, (for_loop_col, expr) in enumerate(matches[:3], start=1):
+            print(f"[CDP{label}] cand#{idx} for-loop col {for_loop_col}, expr {len(expr)} chars")
+            print(f"[CDP{label}] cand#{idx} starts: {expr[:60]}")
+            print(f"[CDP{label}] cand#{idx} ends:   {expr[-60:]}")
 
-        # Find valid V8 BP locations near the for-loop
-        bp_result = await session.send("Debugger.getPossibleBreakpoints", {
-            "start": {
-                "scriptId": evt["scriptId"],
-                "lineNumber": 0,
-                "columnNumber": for_loop_col,
-            },
-            "end": {
-                "scriptId": evt["scriptId"],
-                "lineNumber": 0,
-                "columnNumber": for_loop_col + 200,
-            },
-            "restrictToFunction": False,
-        })
-        locs = bp_result.get("locations", [])
-        print(f"[CDP{label}] {len(locs)} possible BPs near for-loop")
-
-        for loc in locs[:5]:
+        # Set breakpoints near each candidate loop; dedupe columns to reduce noise.
+        seen_cols: set[int] = set()
+        for for_loop_col, _ in matches[:6]:
+            if for_loop_col in seen_cols:
+                continue
+            seen_cols.add(for_loop_col)
             try:
-                r = await session.send("Debugger.setBreakpoint", {
-                    "location": {
+                bp_result = await session.send("Debugger.getPossibleBreakpoints", {
+                    "start": {
                         "scriptId": evt["scriptId"],
-                        "lineNumber": loc["lineNumber"],
-                        "columnNumber": loc["columnNumber"],
-                    }
+                        "lineNumber": 0,
+                        "columnNumber": for_loop_col,
+                    },
+                    "end": {
+                        "scriptId": evt["scriptId"],
+                        "lineNumber": 0,
+                        "columnNumber": for_loop_col + 220,
+                    },
+                    "restrictToFunction": False,
                 })
-                print(f"[CDP{label}] BP set at col {loc['columnNumber']} "
-                      f"id={r['breakpointId']}")
+                locs = bp_result.get("locations", [])
+                print(f"[CDP{label}] {len(locs)} possible BPs near col {for_loop_col}")
+
+                for loc in locs[:4]:
+                    try:
+                        r = await session.send("Debugger.setBreakpoint", {
+                            "location": {
+                                "scriptId": evt["scriptId"],
+                                "lineNumber": loc["lineNumber"],
+                                "columnNumber": loc["columnNumber"],
+                            }
+                        })
+                        print(f"[CDP{label}] BP set at col {loc['columnNumber']} "
+                              f"id={r['breakpointId']}")
+                    except Exception as e:
+                        print(f"[CDP{label}] BP failed col {loc['columnNumber']}: {e}")
             except Exception as e:
-                print(f"[CDP{label}] BP failed col {loc['columnNumber']}: {e}")
+                print(f"[CDP{label}] getPossibleBreakpoints failed near {for_loop_col}: {e}")
     except Exception as e:
         print(f"[CDP{label}] handleChunkParsed error: {e}")
 
@@ -459,10 +506,13 @@ def _make_paused_handler(session: CDPSession, label: str,
                 "location", {}
             ).get("columnNumber")
 
-            expr = state.get("pdkey_closure_expr")
-            if expr and not state.get("pdkey"):
+            expr_candidates = state.get("pdkey_expr_candidates") or []
+            if not expr_candidates and state.get("pdkey_closure_expr"):
+                expr_candidates = [state["pdkey_closure_expr"]]
+
+            if expr_candidates and not state.get("pdkey"):
                 state["_eval_count"] = state.get("_eval_count", 0) + 1
-                if state["_eval_count"] > 3:
+                if state["_eval_count"] > 8:
                     await session.send("Debugger.resume")
                     return
 
@@ -470,40 +520,45 @@ def _make_paused_handler(session: CDPSession, label: str,
                     "callFrameId"
                 )
                 if frame_id:
-                    print(f"[{label}][paused] col {col} — evaluating pdkey closure…")
-                    r = await session.send("Debugger.evaluateOnCallFrame", {
-                        "callFrameId": frame_id,
-                        "expression": expr,
-                        "returnByValue": True,
-                        "throwOnSideEffect": False,
-                    })
-                    if (
-                        "exceptionDetails" not in r
-                        and isinstance(r.get("result", {}).get("value"), str)
-                    ):
-                        val = r["result"]["value"]
-                        print(f"[{label}][eval  ] → \"{val}\" (len={len(val)})")
-                        # v2.4.2 returned "pkey:pdkey"; v2.4.3+ returns pdkey only
-                        if ":" in val:
-                            pkey_part, pdkey_part = val.split(":", 1)
-                            if is_key_candidate(pkey_part) and is_key_candidate(pdkey_part):
-                                if not state.get("pkey"):
-                                    state["pkey"] = pkey_part
-                                if not state.get("pdkey"):
-                                    state["pdkey"] = pdkey_part
-                                print(f"[{label}][FOUND ] pkey=\"{state['pkey']}\" "
-                                      f"pdkey=\"{state['pdkey']}\"")
+                    print(f"[{label}][paused] col {col} — evaluating pdkey candidates…")
+                    for i, expr in enumerate(expr_candidates[:8], start=1):
+                        r = await session.send("Debugger.evaluateOnCallFrame", {
+                            "callFrameId": frame_id,
+                            "expression": expr,
+                            "returnByValue": True,
+                            "throwOnSideEffect": False,
+                        })
+                        if (
+                            "exceptionDetails" not in r
+                            and isinstance(r.get("result", {}).get("value"), str)
+                        ):
+                            val = r["result"]["value"]
+                            print(f"[{label}][eval  ] cand#{i} → \"{val}\" (len={len(val)})")
+                            # v2.4.2 returned "pkey:pdkey"; v2.4.3+ returns pdkey only
+                            if ":" in val:
+                                pkey_part, pdkey_part = val.split(":", 1)
+                                if is_key_candidate(pkey_part) and is_key_candidate(pdkey_part):
+                                    if not state.get("pkey"):
+                                        state["pkey"] = pkey_part
+                                    if not state.get("pdkey"):
+                                        state["pdkey"] = pdkey_part
+                                        state["pdkey_found_at"] = time.monotonic()
+                                    print(f"[{label}][FOUND ] pkey=\"{state['pkey']}\" "
+                                          f"pdkey=\"{state['pdkey']}\"")
+                                    try_resolve()
+                                    break
+                            elif is_key_candidate(val):
+                                state["pdkey"] = val
+                                state["pdkey_found_at"] = time.monotonic()
+                                print(f"[{label}][FOUND ] pdkey=\"{state['pdkey']}\"")
                                 try_resolve()
-                        elif is_key_candidate(val):
-                            state["pdkey"] = val
-                            print(f"[{label}][FOUND ] pdkey=\"{state['pdkey']}\"")
-                            try_resolve()
-                    elif "exceptionDetails" in r:
-                        exc = r["exceptionDetails"]
-                        msg = exc.get("text") or exc.get("exception", {}).get(
-                            "description", "?"
-                        )
-                        print(f"[{label}][eval  ] EXCEPTION: {msg[:200]}")
+                                break
+                        elif "exceptionDetails" in r and i == 1:
+                            exc = r["exceptionDetails"]
+                            msg = exc.get("text") or exc.get("exception", {}).get(
+                                "description", "?"
+                            )
+                            print(f"[{label}][eval  ] cand#{i} EXCEPTION: {msg[:200]}")
 
             await session.send("Debugger.resume")
         except Exception as err:
@@ -556,7 +611,8 @@ async def attach_debugger(session: CDPSession, label: str,
 async def main():
     model = sys.argv[1] if len(sys.argv) > 1 else "MetishaCaprice"
     url = f"https://stripchat.com/{model}"
-    timeout_s = 90
+    timeout_s = int(os.environ.get("SC_TIMEOUT_S", "90"))
+    pdkey_grace_s = int(os.environ.get("SC_PDKEY_GRACE_S", "15"))
 
     print(f"[extract_mmp_keys] Model : {model}")
     print(f"[extract_mmp_keys] URL   : {url}")
@@ -570,11 +626,15 @@ async def main():
         "pkey": None,
         "pdkey": None,
         "pdkey_closure_expr": None,
+        "pdkey_expr_candidates": [],
+        "pdkey_found_at": None,
     }
     done_event = asyncio.Event()
+    attach_tasks: set[asyncio.Task] = set()
 
     def try_resolve():
         if state.get("pkey") and state.get("pdkey"):
+            print("[done  ] both keys captured; finishing…")
             done_event.set()
 
     try:
@@ -625,9 +685,11 @@ async def main():
             w_url = info.get("url", "(unknown)")
             print(f"[worker] Attached {t}: {w_url[-60:]}")
             child = browser.child_session(sid)
-            asyncio.ensure_future(
+            task = asyncio.ensure_future(
                 attach_debugger(child, f"w:{w_url[-30:]}", state, try_resolve)
             )
+            attach_tasks.add(task)
+            task.add_done_callback(attach_tasks.discard)
 
         browser.on("Target.attachedToTarget", on_target_attached)
         await browser.send("Target.setAutoAttach", {
@@ -647,16 +709,41 @@ async def main():
 
         play_task = asyncio.ensure_future(delayed_play())
 
+        # If pdkey is found first, avoid waiting the full timeout for pkey.
+        async def pdkey_grace_monitor():
+            while not done_event.is_set():
+                await asyncio.sleep(0.5)
+                if state.get("pdkey") and not state.get("pkey"):
+                    t0 = state.get("pdkey_found_at")
+                    if t0 and (time.monotonic() - t0) >= pdkey_grace_s:
+                        print(
+                            f"[timeout] pdkey captured but pkey missing after "
+                            f"{pdkey_grace_s}s grace; resolving partial results…"
+                        )
+                        done_event.set()
+                        return
+
+        grace_task = asyncio.ensure_future(pdkey_grace_monitor())
+
         # Wait for both keys or timeout
         try:
-            await asyncio.wait_for(done_event.wait(), timeout=timeout_s - 5)
+            await asyncio.wait_for(done_event.wait(), timeout=timeout_s)
         except asyncio.TimeoutError:
             print("[timeout] Resolving with partial results…")
 
         play_task.cancel()
+        grace_task.cancel()
+        await asyncio.gather(grace_task, return_exceptions=True)
+
+        # Cancel any in-flight worker attach tasks so shutdown cannot hang.
+        for task in list(attach_tasks):
+            if not task.done():
+                task.cancel()
+        if attach_tasks:
+            await asyncio.gather(*attach_tasks, return_exceptions=True)
 
         try:
-            await browser.send("Browser.close")
+            await asyncio.wait_for(browser.send("Browser.close"), timeout=3)
         except Exception:
             pass
 

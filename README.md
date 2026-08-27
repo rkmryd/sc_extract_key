@@ -28,8 +28,19 @@ You need Python 3.10+ and Chrome/Chromium.
 
 ### Setup Python
 
-Get the websockets requirement
+Recommended (uv, creates local .venv with Python 3.10):
+```bash
+uv venv --python 3.10 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
+
+Activate the environment:
+```bash
+source .venv/bin/activate
+```
+
+Alternative (already on Python 3.10+):
+```bash
 pip install -r requirements.txt
 ```
 
@@ -37,6 +48,11 @@ pip install -r requirements.txt
 
 ```
 python3 extract_mmp_keys.py <model_name>
+```
+
+Or run via uv:
+```bash
+uv run --python .venv/bin/python extract_mmp_keys.py <model_name>
 ```
 
 providing a `<model_name>` that is currently online.
